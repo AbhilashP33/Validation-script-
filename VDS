@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Weekly validation: SAS Excel vs SQL Server output
+
+- Loads SQL data and SAS Excel export
+- Normalizes columns and missing values
+- Filters to one report and most recent week
+- Compares row counts, keys, and values
+- Exports a clean Excel workbook + text report
+"""
+
+import os
+from datetime import datetime
+
+import logging
+import numpy as np
+import pandas as pd
+import pyodbc
+from dotenv import load_dotenv
+
+
+# ============================================================
+# 1. LOAD ENVIRONMENT VARIABLES (.env)
+# ============================================================
+
+load_dotenv()
+
+SQL_SERVER   = os.getenv("SQL_SERVER")
+SQL_DATABASE = os.getenv("SQL_DATABASE")
+UID          = os.getenv("UID")
+PWD          = os.getenv("PWD")
+SQL_TABLE    = os.getenv("SQL_TABLE")
+ODBC_DRIVER  = os.getenv("ODBC_DRIVER")
+
+# Root folder assumptions:
+# script -> /.../code
+# prev_dir -> /.../
+# main_dir -> /...
+CUR_DIR  = os.getcwd()
+PREV_DIR = os.path.dirname(CUR_DIR)
+MAIN_DIR = os.path.dirname(PREV_DIR)
+
+EXCEL_FILE = os.path.join(MAIN_DIR, "pa_aot_autocomplete.xlsx")
+OUTPUT_DIR = os.path.join(MAIN_DIR, "Data", "Comparison Reports")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ============================================================
+# 2. LOGGING CONFIGURATION
+# ============================================================
+
+LOG_FOLDER = "/IFS/logs"
+os.makedirs(LOG_FOLDER, exist_ok=True)
+log_filename = datetime.now().strftime("validation_%Y%m%d_%H%M.log")
+
+logging.basicConfig(
+    filename=os.path.join(LOG_FOLDER, log_filename),
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+logging.getLogger("").addHandler(console)
+
+logging.info("========== SCRIPT STARTED ==========")
+
+# ============================================================
+# 3. CONFIGURABLE SETTINGS FOR THIS DATASET
+# ============================================================
+
+# Column rename map to fix SQL column names to match Excel
+RENAME_MAP_SQL = {
+    "ReportName ": "ReportName",  # trailing space
+    # extend if needed
+}
+
+# Composite business key used to match rows
+KEY_COLUMNS = [
+    "SnapDate",
+    "segment2",
+    "segment3",
+    "ReportName",
+    "DateCompleted",
+]
+
+# Date column used for weekly filter
+DATE_COLUMN = "DateCompleted"
+
+# Optional filter to restrict to this report
+FILTER_COLUMN = "ReportName"
+FILTER_VALUE = "C86 AOT Product Appropriateness"
+
+# Volume column for volume check
+VOLUME_COLUMN = "Volume"
+
+
+# ============================================================
+# 4. HELPER FUNCTIONS
+# ============================================================
+
+def normalize_missing(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize missing values across Excel & SQL."""
+    obj_cols = df.select_dtypes(include=["object"]).columns
+
+    # Strip whitespace
+    df[obj_cols] = df[obj_cols].apply(lambda s: s.str.strip())
+
+    # Treat empty strings / 'None' as NaN
+    df[obj_cols] = df[obj_cols].replace(
+        {"": np.nan, "None": np.nan}
+    )
+
+    return df
+
+
+def connect_sql() -> pyodbc.Connection:
+    """Create a SQL Server connection."""
+    try:
+        logging.info("Establishing connection to SQL database")
+        conn = pyodbc.connect(
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={SQL_SERVER};"
+            f"DATABASE={SQL_DATABASE};"
+            f"UID={UID};"
+            f"PWD={PWD};"
+            "TrustServerCertificate=Yes;"
+            "Connection Timeout=30;",
+        )
+        logging.info("Connected to SQL Server successfully.")
+        return conn
+    except Exception as e:
+        logging.error(f"SQL Connection Error: {e}")
+        raise
+
+
+def load_sql_dataframe(conn: pyodbc.Connection) -> pd.DataFrame:
+    """Load the full SQL table into a DataFrame."""
+    try:
+        query = f"SELECT * FROM {SQL_DATABASE}.dbo.{SQL_TABLE}"
+        df = pd.read_sql(query, conn)
+        df.columns = [c.strip() for c in df.columns]
+        logging.info(f"Loaded {len(df)} rows from SQL table.")
+        return df
+    except Exception as e:
+        logging.error(f"Unable to load SQL table: {e}")
+        raise
+
+
+def load_excel_dataframe(path: str) -> pd.DataFrame:
+    """Load the SAS Excel export."""
+    try:
+        df = pd.read_excel(path)
+        df.columns = df.columns.str.strip()
+        logging.info(f"Loaded {len(df)} rows from Excel.")
+        return df
+    except Exception as e:
+        logging.error(f"Unable to load Excel file: {e}")
+        raise
+
+
+def enforce_filters(df_sql: pd.DataFrame, df_excel: pd.DataFrame):
+    """Apply same business filter on both sources."""
+    if FILTER_COLUMN in df_sql.columns:
+        df_sql = df_sql[df_sql[FILTER_COLUMN] == FILTER_VALUE].copy()
+    if FILTER_COLUMN in df_excel.columns:
+        df_excel = df_excel[df_excel[FILTER_COLUMN] == FILTER_VALUE].copy()
+
+    logging.info(
+        f"After ReportName filter – SQL: {len(df_sql)} rows, "
+        f"Excel: {len(df_excel)} rows"
+    )
+    return df_sql, df_excel
+
+
+def convert_dates(df_sql: pd.DataFrame, df_excel: pd.DataFrame):
+    """Convert key date columns to datetime."""
+    for col in ["SnapDate", "DateCompleted"]:
+        if col in df_sql.columns:
+            df_sql[col] = pd.to_datetime(df_sql[col], errors="coerce")
+        if col in df_excel.columns:
+            df_excel[col] = pd.to_datetime(df_excel[col], errors="coerce")
+    return df_sql, df_excel
+
+
+def most_recent_week(df_sql: pd.DataFrame):
+    """Return the latest non-null DateCompleted in SQL."""
+    valid_dates = df_sql[DATE_COLUMN].dropna()
+    if valid_dates.empty:
+        logging.error("No valid dates found in SQL dataset.")
+        raise ValueError("Cannot determine most recent week.")
+    latest_date = valid_dates.max().normalize()
+    logging.info(f"Most recent week detected: {latest_date.date()}")
+    return latest_date
+
+
+def slice_week(df_sql: pd.DataFrame,
+               df_excel: pd.DataFrame,
+               latest_date: pd.Timestamp):
+    """Slice both datasets to the latest week."""
+    df_sql_week = df_sql[df_sql[DATE_COLUMN].dt.normalize() == latest_date].copy()
+    df_excel_week = df_excel[df_excel[DATE_COLUMN].dt.normalize() == latest_date].copy()
+
+    logging.info(
+        f"Week rows – SQL: {len(df_sql_week)}, Excel: {len(df_excel_week)}"
+    )
+
+    if len(df_sql_week) == 0 or len(df_excel_week) == 0:
+        logging.warning(
+            "One source contains no data for selected week –"
+            " comparison may be meaningless."
+        )
+    return df_sql_week, df_excel_week
+
+
+def check_column_sets(df_sql_week: pd.DataFrame,
+                      df_excel_week: pd.DataFrame):
+    """Check which columns exist / are missing in each side."""
+    cols_sql = set(df_sql_week.columns)
+    cols_excel = set(df_excel_week.columns)
+
+    missing_in_sql = cols_excel - cols_sql
+    missing_in_excel = cols_sql - cols_excel
+
+    logging.info(f"Columns missing in SQL: {missing_in_sql}")
+    logging.info(f"Columns missing in Excel: {missing_in_excel}")
+
+    return cols_sql, cols_excel, missing_in_sql, missing_in_excel
+
+
+def prepare_for_merge(df_sql_week: pd.DataFrame,
+                      df_excel_week: pd.DataFrame,
+                      cols_sql,
+                      cols_excel):
+    """Keep only common columns for merge."""
+    common_columns = list(cols_sql & cols_excel)
+
+    df_sql_common = df_sql_week[common_columns].copy()
+    df_excel_common = df_excel_week[common_columns].copy()
+
+    return common_columns, df_sql_common, df_excel_common
+
+
+def merge_sources(df_sql_common: pd.DataFrame,
+                  df_excel_common: pd.DataFrame,
+                  common_columns):
+    """Outer merge on composite key."""
+    merged = pd.merge(
+        df_excel_common,
+        df_sql_common,
+        on=KEY_COLUMNS,
+        how="outer",
+        indicator=True,
+        suffixes=("_excel", "_sql"),
+    )
+
+    df_only_excel = merged[merged["_merge"] == "left_only"].copy()
+    df_only_sql = merged[merged["_merge"] == "right_only"].copy()
+    df_common = merged[merged["_merge"] == "both"].copy()
+
+    logging.info(
+        f"Merged result – Only in Excel: {len(df_only_excel)}, "
+        f"Only in SQL: {len(df_only_sql)}, Common: {len(df_common)}"
+    )
+
+    return merged, df_only_excel, df_only_sql, df_common
+
+
+def compute_value_differences(merged: pd.DataFrame,
+                              common_columns):
+    """
+    Grouped value-level differences:
+    - one row per mismatching column
+    - includes row count + sample differences
+    """
+    value_discrepancies = []
+
+    for col in common_columns:
+        if col in KEY_COLUMNS:
+            continue
+
+        col_excel = f"{col}_excel"
+        col_sql = f"{col}_sql"
+
+        if col_excel not in merged.columns or col_sql not in merged.columns:
+            continue
+
+        mism_mask = (
+            merged[col_excel].fillna("<<MISSING>>")
+            !=
+            merged[col_sql].fillna("<<MISSING>>")
+        )
+        mism_rows = merged[mism_mask]
+
+        if len(mism_rows) > 0:
+            sample = mism_rows[
+                KEY_COLUMNS + [col_excel, col_sql]
+            ].head(5).to_dict(orient="records")
+
+            value_discrepancies.append({
+                "Column": col,
+                "RowsAffected": len(mism_rows),
+                "SampleDifferences": sample,
+            })
+
+    df_value_diff = pd.DataFrame(value_discrepancies)
+    logging.info(
+        f"Columns with value differences: "
+        f"{list(df_value_diff['Column']) if not df_value_diff.empty else []}"
+    )
+    return df_value_diff
+
+
+def duplicate_checks(df_sql_week: pd.DataFrame,
+                     df_excel_week: pd.DataFrame):
+    """Full-row duplicate detection."""
+    dup_excel = df_excel_week[df_excel_week.duplicated(keep=False)].copy()
+    dup_sql = df_sql_week[df_sql_week.duplicated(keep=False)].copy()
+
+    logging.info(
+        f"Duplicate rows – Excel: {len(dup_excel)}, SQL: {len(dup_sql)}"
+    )
+    return dup_excel, dup_sql
+
+
+def volume_check(df_sql_week: pd.DataFrame,
+                 df_excel_week: pd.DataFrame):
+    """Volume sums comparison."""
+    volume_sql = df_sql_week[VOLUME_COLUMN].astype(float).sum()
+    volume_excel = df_excel_week[VOLUME_COLUMN].astype(float).sum()
+    volume_match = (volume_sql == volume_excel)
+
+    logging.info(
+        f"Volume SQL: {volume_sql} "
+        f"Excel: {volume_excel} "
+        f"Match: {volume_match}"
+    )
+
+    return volume_sql, volume_excel, volume_match
+
+
+# ============================================================
+# 5. MAIN
+# ============================================================
+
+def main():
+    # ----- Load data -----
+    conn = connect_sql()
+    df_sql = load_sql_dataframe(conn)
+    df_excel = load_excel_dataframe(EXCEL_FILE)
+
+    # Column rename + normalization
+    df_sql.rename(columns=RENAME_MAP_SQL, inplace=True)
+    df_sql = normalize_missing(df_sql)
+    df_excel = normalize_missing(df_excel)
+
+    # Same filters both sides
+    df_sql, df_excel = enforce_filters(df_sql, df_excel)
+
+    # Date conversions
+    df_sql, df_excel = convert_dates(df_sql, df_excel)
+
+    # Latest week
+    latest_date = most_recent_week(df_sql)
+    df_sql_week, df_excel_week = slice_week(df_sql, df_excel, latest_date)
+
+    # Column set checks
+    cols_sql, cols_excel, missing_in_sql, missing_in_excel = \
+        check_column_sets(df_sql_week, df_excel_week)
+
+    # Prepare & merge
+    common_columns, df_sql_common, df_excel_common = \
+        prepare_for_merge(df_sql_week, df_excel_week, cols_sql, cols_excel)
+
+    merged, df_only_excel, df_only_sql, df_common = \
+        merge_sources(df_sql_common, df_excel_common, common_columns)
+
+    # Value-level differences (grouped)
+    df_value_diff = compute_value_differences(merged, common_columns)
+
+    # Duplicates + volume
+    dup_excel, dup_sql = duplicate_checks(df_sql_week, df_excel_week)
+    volume_sql, volume_excel, volume_match = volume_check(
+        df_sql_week, df_excel_week
+    )
+
+    # ----- Export results -----
+    timestamp = datetime.now().strftime("%Y%m%d")
+    output_excel = os.path.join(OUTPUT_DIR, f"Weekly_Comparison_{timestamp}.xlsx")
+    output_txt = os.path.join(OUTPUT_DIR, f"Weekly_Comparison_{timestamp}.txt")
+
+    # Summary metrics
+    summary_df = pd.DataFrame({
+        "Metric": [
+            "SQL Rows",
+            "Excel Rows",
+            "SQL Volume",
+            "Excel Volume",
+            "Volume Match?",
+            "# Only in Excel",
+            "# Only in SQL",
+            "# Columns with Value Differences",
+            "# Duplicate Excel Rows",
+            "# Duplicate SQL Rows",
+        ],
+        "Value": [
+            len(df_sql_week),
+            len(df_excel_week),
+            volume_sql,
+            volume_excel,
+            volume_match,
+            len(df_only_excel),
+            len(df_only_sql),
+            0 if df_value_diff.empty else len(df_value_diff),
+            len(dup_excel),
+            len(dup_sql),
+        ],
+    })
+
+    # ----- Excel export (better layout) -----
+    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+        # Put Summary first
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        df_common.to_excel(writer, sheet_name="Common", index=False)
+        df_only_excel.to_excel(writer, sheet_name="Only_in_Excel", index=False)
+        df_only_sql.to_excel(writer, sheet_name="Only_in_SQL", index=False)
+        df_value_diff.to_excel(writer, sheet_name="Value_Differences", index=False)
+        dup_excel.to_excel(writer, sheet_name="Duplicates_Excel", index=False)
+        dup_sql.to_excel(writer, sheet_name="Duplicates_SQL", index=False)
+
+        # Freeze top row for all sheets
+        from openpyxl.utils import get_column_letter
+
+        wb = writer.book
+        for ws in wb.worksheets:
+            ws.freeze_panes = "A2"
+            # basic auto-width
+            for col_idx, col in enumerate(ws.columns, start=1):
+                max_len = 0
+                for cell in col:
+                    try:
+                        val = str(cell.value)
+                    except Exception:
+                        val = ""
+                    max_len = max(max_len, len(val))
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(
+                    max_len + 2, 60
+                )
+
+    # ----- Text report (clean) -----
+    with open(output_txt, "w", encoding="utf-8") as f:
+        f.write("WEEKLY DATA VALIDATION REPORT\n")
+        f.write(f"Week of: {latest_date.date()}\n\n")
+
+        f.write("ROW & VOLUME CHECKS\n")
+        f.write("--------------------\n")
+        f.write(f"SQL rows:   {len(df_sql_week)}\n")
+        f.write(f"Excel rows: {len(df_excel_week)}\n")
+        f.write(f"SQL volume:   {volume_sql}\n")
+        f.write(f"Excel volume: {volume_excel}\n")
+        f.write(f"Volume match: {volume_match}\n\n")
+
+        f.write("COLUMN PRESENCE\n")
+        f.write("---------------\n")
+        f.write(f"Missing in SQL:   {sorted(missing_in_sql)}\n")
+        f.write(f"Missing in Excel: {sorted(missing_in_excel)}\n\n")
+
+        f.write("UNMATCHED KEYS\n")
+        f.write("--------------\n")
+        f.write(f"Rows only in Excel: {len(df_only_excel)}\n")
+        f.write(f"Rows only in SQL:   {len(df_only_sql)}\n\n")
+
+        f.write("VALUE DIFFERENCES (GROUPED BY COLUMN)\n")
+        f.write("-------------------------------------\n")
+        if df_value_diff.empty:
+            f.write("No value-level differences detected.\n\n")
+        else:
+            for _, row in df_value_diff.iterrows():
+                f.write(
+                    f"Column: {row['Column']} "
+                    f"– Rows affected: {row['RowsAffected']}\n"
+                )
+            f.write("\n")
+
+        f.write("DUPLICATES\n")
+        f.write("----------\n")
+        f.write(f"Duplicate Excel rows: {len(dup_excel)}\n")
+        f.write(f"Duplicate SQL rows:   {len(dup_sql)}\n")
+
+    logging.info("Excel report saved: %s", output_excel)
+    logging.info("Text report saved: %s", output_txt)
+    logging.info("========== SCRIPT FINISHED ==========")
+
+
+if __name__ == "__main__":
+    main()
